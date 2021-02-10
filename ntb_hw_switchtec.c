@@ -94,10 +94,12 @@ struct switchtec_ntb {
 	struct ntb_dbmsg_regs __iomem *mmio_dbmsg;
 	struct ntb_ctrl_regs __iomem *mmio_self_ctrl;
 	struct ntb_ctrl_regs __iomem *mmio_peer_ctrl;
+	struct ntb_ctrl_regs __iomem *mmio_xlink_peer_ctrl;
 	struct ntb_dbmsg_regs __iomem *mmio_self_dbmsg;
 	struct ntb_dbmsg_regs __iomem *mmio_peer_dbmsg;
 
 	void __iomem *mmio_xlink_win;
+	void __iomem *mmio_xlink_ntb_ctl_win;
 
 	struct shared_mw *self_shared;
 	struct shared_mw __iomem *peer_shared;
@@ -534,6 +536,9 @@ enum switchtec_msg {
 
 static int switchtec_ntb_reinit_peer(struct switchtec_ntb *sndev);
 
+static int crosslink_setup_req_ids(struct switchtec_ntb *sndev,
+	struct ntb_ctrl_regs __iomem *mmio_ctrl);
+
 static void switchtec_ntb_link_status_update(struct switchtec_ntb *sndev)
 {
 	int link_sta;
@@ -558,8 +563,11 @@ static void switchtec_ntb_link_status_update(struct switchtec_ntb *sndev)
 		dev_info(&sndev->stdev->dev, "ntb link %s\n",
 			 link_sta ? "up" : "down");
 
-		if (link_sta)
+		if (link_sta) {
+			crosslink_setup_req_ids(sndev,
+						sndev->mmio_xlink_peer_ctrl);
 			crosslink_init_dbmsgs(sndev);
+		}
 	}
 }
 
@@ -1154,7 +1162,9 @@ static int clr_req_ids(struct switchtec_ntb *sndev,
 	return 0;
 }
 
-static int crosslink_setup_mws(struct switchtec_ntb *sndev, int ntb_lut_idx,
+static int crosslink_setup_mws(struct switchtec_ntb *sndev,
+			       int ntb_dbmsg_lut_idx,
+			       int ntb_req_id_lut_idx,
 			       u64 *mw_addrs, int mw_count)
 {
 	int rc, i;
@@ -1171,7 +1181,7 @@ static int crosslink_setup_mws(struct switchtec_ntb *sndev, int ntb_lut_idx,
 		return rc;
 
 	for (i = 0; i < sndev->nr_lut_mw; i++) {
-		if (i == ntb_lut_idx)
+		if (i == ntb_dbmsg_lut_idx || i == ntb_req_id_lut_idx)
 			continue;
 
 		addr = mw_addrs[0] + LUT_SIZE * i;
@@ -1289,7 +1299,8 @@ static int switchtec_ntb_init_crosslink(struct switchtec_ntb *sndev)
 {
 	int rc;
 	int bar = sndev->direct_mw_to_bar[0];
-	const int ntb_lut_idx = 1;
+	const int ntb_dbmsg_lut_idx = 1;
+	const int ntb_req_id_lut_idx = 2;
 	u64 bar_addrs[6];
 	u64 addr;
 	int offset;
@@ -1315,19 +1326,41 @@ static int switchtec_ntb_init_crosslink(struct switchtec_ntb *sndev)
 	offset = addr & (LUT_SIZE - 1);
 	addr -= offset;
 
-	rc = config_rsvd_lut_win(sndev, sndev->mmio_self_ctrl, ntb_lut_idx,
+	rc = config_rsvd_lut_win(sndev, sndev->mmio_self_ctrl,
+				 ntb_dbmsg_lut_idx,
 				 sndev->peer_partition, addr);
 	if (rc)
 		return rc;
 
-	rc = crosslink_setup_mws(sndev, ntb_lut_idx, &bar_addrs[1],
-				 bar_cnt - 1);
+	addr = (bar_addrs[0] + SWITCHTEC_GAS_NTB_OFFSET +
+		SWITCHTEC_NTB_REG_CTRL_OFFSET +
+		sizeof(struct ntb_ctrl_regs) * sndev->peer_partition);
+
+	offset = addr & (LUT_SIZE - 1);
+	addr -= offset;
+
+	rc = config_rsvd_lut_win(sndev, sndev->mmio_self_ctrl,
+				 ntb_req_id_lut_idx,
+				 sndev->peer_partition, addr);
 	if (rc)
 		return rc;
 
-	rc = crosslink_setup_req_ids(sndev, sndev->mmio_peer_ctrl);
+	rc = crosslink_setup_mws(sndev, ntb_dbmsg_lut_idx, ntb_req_id_lut_idx,
+				 &bar_addrs[1], bar_cnt - 1);
 	if (rc)
 		return rc;
+
+	sndev->mmio_xlink_ntb_ctl_win = pci_iomap_range(sndev->stdev->pdev, bar,
+			ntb_req_id_lut_idx * LUT_SIZE, LUT_SIZE);
+	if (!sndev->mmio_xlink_ntb_ctl_win) {
+		rc = -ENOMEM;
+		return rc;
+	}
+
+	sndev->mmio_xlink_peer_ctrl = sndev->mmio_xlink_ntb_ctl_win + offset;
+	sndev->nr_rsvd_luts++;
+
+	crosslink_setup_req_ids(sndev, sndev->mmio_xlink_peer_ctrl);
 
 	sndev->mmio_xlink_win = pci_iomap_range(sndev->stdev->pdev, bar,
 						LUT_SIZE, LUT_SIZE);
@@ -1659,7 +1692,8 @@ static ssize_t add_requester_id_store(struct device *dev,
 		return rc;
 
 	if (crosslink_is_enabled(sndev)) {
-		rc = crosslink_setup_req_ids(sndev, sndev->mmio_peer_ctrl);
+		rc = crosslink_setup_req_ids(sndev,
+					     sndev->mmio_xlink_peer_ctrl);
 		if (rc)
 			return rc;
 	}
@@ -1687,7 +1721,8 @@ static ssize_t del_requester_id_store(struct device *dev,
 		return rc;
 
 	if (crosslink_is_enabled(sndev)) {
-		rc = crosslink_setup_req_ids(sndev, sndev->mmio_peer_ctrl);
+		rc = crosslink_setup_req_ids(sndev,
+					     sndev->mmio_xlink_peer_ctrl);
 		if (rc)
 			return rc;
 	}
